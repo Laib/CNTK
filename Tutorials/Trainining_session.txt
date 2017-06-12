@@ -1,0 +1,60 @@
+Training session and manual minibatch loop
+
+This tutorial demonstrates different aspects of the training session and discusses scenarios that benefit from it the most.
+Note: Please consider using Function.train method instead of directly using the training session API.
+
+Typical CNTK script with manual loop
+
+Many CNTK scripts have a very similar structure:
+ - they create a network
+ - create an instance of the Trainer and Learner classes picking up appropriate hyper parameters
+ - instantiate minibatch sources that will be used for train and evaluation
+ - run the main training loop fetching the data from the train minibatch source and feeding it to the trainer for N samples/sweeps
+ - run the eval loop fetching the data from the test minibatch source and feeding it to Trainer.test_minibatch
+
+As an example for such a script we will take a toy task of learning an XOR operation with a simple feed forward network.
+The script follows the described above workflow:
+
+This is a toy example, but imaging a situation when you job has to run for a couple of days. The user has complete flexibility how to feed the data, but she also has to take several not so obvious things into account.
+
+1. For the fast training above high availability is not important, but imaging the case when training spans several weeks or days. If the machine reboots, goes down or the script has a bug you will have to rerun the same experiment from the beginning which is not always desirable. To avoid tha the user needs to perform checkpoints from time to time. It can be accomplished by saving the model using save_model method on the function, but this function only saves the model state. If the whole state of the script should be saved, the user has to manually get current position in the minibatch source with get_checkpoint() method and save the state of the trainer/learners/minibatch source using the save_checkpoint method of the trainer. The user will also have to take care about restoring from the checkpoint on the restart.
+
+The code can look something like this:
+
+2. Now imaging you want to run cross validation each X samples. Similarly to the checkpointing, you will have to adapt the minibatch loop to perform cross validation.
+
+3. At some point the user will probably want to parallelize the script to decrease the training time. For that, she needs to wrap the learner into the corresponding distributed learner and make sure she picks up the data from the minibatch source based on the current worker rank:
+
+Please notice that decisions inside the loop are made based on the Trainer.total_number_of_samples. In order for distribution to work properly in CNTK, the minibatch loop should exit by all workers at the same time. This is guaranteed only if all code branches inside the loop that require synchroization (i.e. train_minibatch, checkpoint, cross validation, if done in a distributed fashion) base their decision only on Trainer.total_number_of_samples_seen.
+
+So even though writing manual script brings all flexibility to the user, it can also be error prone and require a lot of boilerplate code to make everything work. When this flexibility if not required, it is better to use the training session.
+
+
+Using Training Session
+
+Instead of writing the training loop manually and taking care of checkpointing and distribution herself, the user can delegate this aspects to the TrainingSession. It automatically takes care of the following things:
+    1) checkpointing
+    2) cross validation
+    3) testing/evaluation
+
+All that is needed from the user is to provide the corresponding configuration parameters.
+
+Instead of the manual loops above the script would look like follows:
+   training_session(
+       trainer = trainer,
+       mb_size = minibatch_size, #samples
+       progress_frequency = 4, #samples
+       mb_source = train_mb_source,
+       checkpoint_config = CheckpointConfig(frequency=100), #samples,
+       cv_config = CrossValidationConfig(cv_mb_source), 
+       test_config = TestConfig(test_mb_source, mb_size=32)
+   ).train()
+
+
+Training session is implemented in the C++ code, in order to report the progress, it uses Trainer summarize_training_progress after each progress_frequency samples. Implicitly this call is despatched to the correspnding calls of the ProgressWriter. If you need to have a custom logic for retrieving current status, please consider implementing your own ProgressWriter or using Function.train() method. Please also take into account, that the progress writer should be specified on the trainer not on the training session.
+
+Checkpointing configuraiton specifies how often to perform a checkpoint. When given, the training session takes care of saving/restoring the state for the trainer/learners/minibatch source and propogate this information among distributed workers. If you need to preserve all checkpoints that were taken during training, please specify set preserveAll to true.
+
+Cross validation configuration runs the cross validation with specified frequency and report average error and the number of samples used for cross validation. The user can also provide a cross validation callback, that will be called with the specified frequency, it is up to the user to perform cross validation in this case. If the callback returns false the training will be stopped, this can be used for the early stopping.
+
+Test configuration controls the last evaluation on the model, it runs forward propagation for the data specified by the test_minibatch source and call trainer.update_test_summary at the end reporting the average error and the number of samples seen.
